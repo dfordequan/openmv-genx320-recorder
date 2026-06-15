@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# data outputs
+*.npz
+*.gif
+*.mp4
+*.png
+!docs/*.png
