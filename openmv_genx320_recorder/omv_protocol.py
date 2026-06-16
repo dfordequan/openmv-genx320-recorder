@@ -362,27 +362,60 @@ class OmvProtocol:
 
     def _request(self, channel: int, opcode: int, payload: bytes = b"",
                  flags: int = 0, timeout: float = 2.0) -> Packet:
-        """Send a request, drop unsolicited events, auto-ACK data responses.
+        """Send a request, drop unsolicited events, auto-ACK data responses,
+        and reassemble fragmented responses transparently.
 
-        Returns the first non-event packet received that matches `opcode`.
-        Events are silently consumed. Data packets (no ACK/NAK flag) get
-        auto-ACKed using their own (opcode, sequence) per protocol spec.
+        Large responses (size > max_payload) are split by the firmware into
+        multiple packets, all but the last carrying FLAG_FRAGMENT. We ACK each
+        fragment (the firmware's send_packet path waits for an ACK per
+        fragment) and concatenate their payloads, returning a single Packet
+        whose .payload contains the full reassembled data.
         """
         seq_sent = self._send(channel, opcode, payload, flags)
         if getattr(self, "_debug", False):
             print(f"  → tx: opcode=0x{opcode:02X} chan={channel} seq={seq_sent} "
                   f"len={len(payload)}")
+
+        accumulated = bytearray()
+        first_pkt: Optional[Packet] = None
         while True:
             pkt = self._recv(timeout=timeout)
             if getattr(self, "_debug", False):
                 print(f"  ← rx: opcode=0x{pkt.opcode:02X} flags=0x{pkt.flags:02X} "
                       f"seq={pkt.sequence} chan={pkt.channel} len={pkt.length}")
             if pkt.is_event:
+                # SYS_EVENT carrying SOFT_REBOOT (0x02) means the device
+                # called omv_protocol_reset() — ctx.sequence is now 0, so we
+                # must reset ours too or we'll drift by however many requests
+                # we've sent.
+                if (pkt.opcode == OP_SYS_EVENT
+                        and pkt.payload[:2] == b"\x02\x00"):
+                    self._seq = 0
                 continue
-            if (self._ack_enabled
-                    and not pkt.is_ack and not pkt.is_nak):
+
+            is_data = not pkt.is_ack and not pkt.is_nak
+            if self._ack_enabled and is_data:
                 self._ack(pkt.opcode, pkt.sequence, pkt.channel)
-            return pkt
+
+            if first_pkt is None:
+                first_pkt = pkt
+
+            accumulated.extend(pkt.payload)
+
+            if pkt.flags & FLAG_FRAGMENT:
+                # More fragments coming; continue reading.
+                continue
+
+            # Final fragment (or single-packet response). Each fragment that
+            # arrived above incremented the device's ctx.sequence, but our
+            # _seq only incremented once when we sent the request. Re-sync:
+            # device's ctx.sequence is now `pkt.sequence + 1`, so our next
+            # request should use that.
+            self._seq = (pkt.sequence + 1) & 0xFF
+
+            first_pkt.payload = bytes(accumulated)
+            first_pkt.length = len(first_pkt.payload)
+            return first_pkt
 
     # ----- high-level helpers --------------------------------------------
 
