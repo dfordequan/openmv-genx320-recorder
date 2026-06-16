@@ -72,10 +72,19 @@ def run(argv: list[str]) -> int:
         print(f"error: no such file: {args.file}", file=sys.stderr)
         return 1
 
-    events, meta = fmt.load_recording(args.file)
+    try:
+        mode = fmt.detect_mode(args.file)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    if mode == fmt.MODE_HISTO:
+        return _analyze_histo(args)
+
+    events, meta = fmt.load_events(args.file)
     n = events.shape[0]
 
-    print(f"=== file: {args.file} ===")
+    print(f"=== file: {args.file} (event mode) ===")
     print(f"events: {n}")
     print(f"metadata: {meta}")
     print()
@@ -241,6 +250,118 @@ def run(argv: list[str]) -> int:
         axes[0].axvspan(gs / 1e6, ge / 1e6, color="red", alpha=0.3)
     axes[1].plot(t_us / 1e6, np.arange(1, n + 1), lw=0.5)
     axes[1].set_ylabel("cumulative events")
+    axes[1].set_xlabel("time (s)")
+    fig.tight_layout()
+    if args.save:
+        fig.savefig(args.save, dpi=100)
+        print(f"plot saved to {args.save}")
+    else:
+        plt.show()
+    return 0
+
+
+def _analyze_histo(args) -> int:
+    frames, ts_us, meta = fmt.load_frames(args.file)
+    n = frames.shape[0]
+
+    print(f"=== file: {args.file} (histo mode) ===")
+    print(f"frames: {n}")
+    print(f"metadata: {meta}")
+    print()
+
+    if n == 0:
+        print("(empty recording)")
+        return 0
+
+    # --- pipeline integrity (frames as units) -----------------------------
+    print("--- 1. pipeline integrity ---")
+    dev_total = meta.get("frames")
+    dec_total = meta.get("decoded_events")  # generic 'decoded count' name
+    chunks_rx = meta.get("chunks_received")
+    chunks_bad = meta.get("chunks_malformed")
+    if dev_total is not None and dec_total is not None:
+        delta = dev_total - dec_total
+        status = "OK" if delta == 0 else f"MISMATCH ({delta} frames unaccounted)"
+        print(f"  device reported : {dev_total}")
+        print(f"  host decoded    : {dec_total}  → {status}")
+    if chunks_rx is not None:
+        print(f"  chunks received : {chunks_rx}")
+        print(f"  chunks malformed: {chunks_bad}  "
+              f"({'OK' if chunks_bad == 0 else 'WARNING'})")
+    print()
+
+    # --- frame rate analysis ---------------------------------------------
+    print("--- 2. frame rate ---")
+    span_us = int(ts_us[-1] - ts_us[0])
+    span_s = span_us / 1e6
+    fps = (n - 1) / max(span_s, 1e-9)
+    print(f"  timespan        : {span_s:.3f} s")
+    print(f"  frames captured : {n}")
+    print(f"  achieved FPS    : {fps:.1f}")
+    print(f"  requested FPS   : {meta.get('framerate_requested', '?')}")
+    if n >= 2:
+        dts = np.diff(ts_us)
+        median_dt_us = int(np.median(dts))
+        max_dt_us = int(dts.max())
+        min_dt_us = int(dts.min())
+        print(f"  inter-frame Δt  : median={median_dt_us} µs, "
+              f"min={min_dt_us} µs, max={max_dt_us} µs")
+        # Flag dropped frames: any Δt > 2× the median is suspicious.
+        gaps = dts > (2 * median_dt_us)
+        n_gaps = int(gaps.sum())
+        if n_gaps:
+            print(f"  WARNING: {n_gaps} inter-frame gaps > 2× median "
+                  "(possible dropped frame slots, USB stall, or sensor stall)")
+    print()
+
+    # --- per-frame brightness sanity -------------------------------------
+    print("--- 3. frame content ---")
+    means = frames.reshape(n, -1).mean(axis=1)
+    print(f"  per-frame mean: median={float(np.median(means)):.1f}  "
+          f"min={float(means.min()):.1f}  max={float(means.max()):.1f}")
+    blank = int((means < 1.0).sum())
+    sat = int((means > 254.0).sum())
+    if blank:
+        print(f"  WARNING: {blank} frames are nearly all-black")
+    if sat:
+        print(f"  WARNING: {sat} frames are nearly all-white")
+    print()
+
+    # --- verdict ---------------------------------------------------------
+    print("--- verdict ---")
+    issues = []
+    if dev_total is not None and dec_total is not None and dev_total != dec_total:
+        issues.append(f"frame transfer mismatch ({dev_total - dec_total} frames)")
+    if chunks_bad:
+        issues.append(f"{chunks_bad} malformed chunks")
+    if not issues:
+        print("  ✓ pipeline integrity OK — all frames accounted for")
+    else:
+        print("  ✗ issues detected:")
+        for s in issues:
+            print(f"    - {s}")
+    print()
+
+    if args.no_plot or n < 2:
+        return 0
+
+    try:
+        import matplotlib
+    except ImportError:
+        print("(matplotlib not installed; install with 'pip install matplotlib' "
+              "for plots)", file=sys.stderr)
+        return 0
+    if args.save:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    t_s = ts_us[1:] / 1e6
+    axes[0].plot(t_s, 1e6 / np.maximum(np.diff(ts_us), 1), lw=0.6)
+    axes[0].set_ylabel("instantaneous FPS")
+    axes[0].set_title(f"{args.file}: frame timing ({fps:.1f} FPS avg)")
+    axes[1].plot(ts_us / 1e6, means, lw=0.6)
+    axes[1].set_ylabel("mean pixel value")
     axes[1].set_xlabel("time (s)")
     fig.tight_layout()
     if args.save:

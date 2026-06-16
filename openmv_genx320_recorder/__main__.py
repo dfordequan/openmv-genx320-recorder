@@ -44,9 +44,14 @@ def _select_port(explicit: Optional[str]) -> str:
 def _cmd_record(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(
         prog="genx320 record",
-        description="Record raw events from an OpenMV + GenX320. "
+        description="Record from an OpenMV + GenX320. "
                     "Stops on Ctrl+C (or after --duration).",
     )
+    ap.add_argument("--mode", choices=("events", "histo"), default="events",
+                    help="recording mode (default: events). "
+                         "'events' = raw asynchronous events (N×6 uint16). "
+                         "'histo' = 320×320 grayscale event-histogram frames "
+                         "accumulated on-chip, like a normal camera.")
     ap.add_argument("--port", default=None,
                     help="serial device (default: auto-detect)")
     ap.add_argument("--duration", type=float, default=None,
@@ -54,9 +59,11 @@ def _cmd_record(argv: List[str]) -> int:
     ap.add_argument("--output", "-o", default=None,
                     help="output .npz path (default: recording_TIMESTAMP.npz)")
     ap.add_argument("--evt-res", type=int, default=2048,
-                    help="per-ioctl event buffer size (pow2 in [1024, 65536], "
-                         "default 2048). Larger = better headroom at high event "
-                         "rates but more RAM on the device.")
+                    help="[events mode] per-ioctl event buffer size "
+                         "(pow2 in [1024, 65536], default 2048)")
+    ap.add_argument("--framerate", type=int, default=30,
+                    help="[histo mode] target frame rate in Hz (default 30). "
+                         "Higher rates may exceed USB throughput.")
     ap.add_argument("--no-status", action="store_true",
                     help="suppress the live status line")
     ap.add_argument("--no-verify", action="store_true",
@@ -65,26 +72,38 @@ def _cmd_record(argv: List[str]) -> int:
 
     port = _select_port(args.port)
 
-    if not args.no_verify:
-        print(f"[record] verifying GenX320 on {port} …")
+    if not args.no_verify and args.mode == "events":
+        print(f"[record] verifying GenX320 event-mode APIs on {port} …")
         err = cam_mod.confirm_genx320(port)
         if err:
             print(f"error: {err}", file=sys.stderr)
             print(
                 "hint: this firmware may not expose the GenX320 event-mode "
                 "APIs. update via OpenMV IDE → Tools → Install latest "
-                "development firmware.", file=sys.stderr,
+                "development firmware.\n"
+                "histogram mode (`--mode histo`) works on older firmware too.",
+                file=sys.stderr,
             )
             return 2
 
-    events, meta, out_path = record_mod.record(
-        port=port,
-        output_path=args.output,
-        duration_s=args.duration,
-        evt_res=args.evt_res,
-        show_status=not args.no_status,
-    )
-    record_mod.print_summary(events, meta, out_path)
+    if args.mode == "events":
+        events, meta, out_path = record_mod.record_events(
+            port=port,
+            output_path=args.output,
+            duration_s=args.duration,
+            evt_res=args.evt_res,
+            show_status=not args.no_status,
+        )
+        record_mod.print_events_summary(events, meta, out_path)
+    else:
+        frames, ts, meta, out_path = record_mod.record_histo(
+            port=port,
+            output_path=args.output,
+            duration_s=args.duration,
+            framerate=args.framerate,
+            show_status=not args.no_status,
+        )
+        record_mod.print_histo_summary(frames, ts, meta, out_path)
     return 0
 
 

@@ -1,9 +1,13 @@
-"""Record raw events from an OpenMV + GenX320.
+"""Record from an OpenMV + GenX320 in either event mode or histogram mode.
 
-Records until Ctrl+C (or until --duration expires) and saves the events to a
-.npz file. Streams events from the camera while running so peak host RAM is
-proportional to the recording length × event rate, not bounded by a fixed
-buffer on the device.
+Records until Ctrl+C (or until --duration expires) and saves to a .npz file.
+Both modes use the same streaming framing (one chunk per output line) — only
+the per-chunk payload format differs:
+  - mode='events': "C N <b64>"  (N events × 6 uint16, decoded events)
+  - mode='histo':  "F T <b64>"  (one 320×320 uint8 grayscale frame at t=T µs)
+
+Peak host RAM is proportional to recording length × rate, not bounded by a
+fixed on-device buffer.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from . import format as fmt
 #
 # DURATION_MS is set by the host. For "record until Ctrl+C" the host passes a
 # very large value (e.g. 24h) and interrupts the script with Ctrl+C.
-_CAPTURE_SCRIPT = r"""
+_EVENTS_SCRIPT = r"""
 import sys, time, binascii
 import csi
 from ulab import numpy as np
@@ -92,6 +96,58 @@ sys.stdout.write("<<<END>>>\n")
 """
 
 
+# Histogram-mode capture script. The GenX320 on this firmware accumulates events
+# into a 320×320 grayscale "event histogram" frame at whatever framerate is set
+# (default uses the sensor's natural cadence). Each frame is base64-emitted as
+# one "F <t_us> <b64>" line; host parses incrementally.
+_HISTO_SCRIPT = r"""
+import sys, time, binascii
+import csi
+
+WIDTH = 320
+HEIGHT = 320
+FRAMERATE = {framerate}
+DURATION_MS = {duration_ms}
+
+cam = csi.CSI(cid=csi.GENX320)
+cam.reset()
+cam.pixformat(csi.GRAYSCALE)
+cam.framesize((WIDTH, HEIGHT))
+try:
+    cam.framerate(FRAMERATE)
+    fr_ok = "ok"
+except BaseException as e:
+    fr_ok = repr(e)
+
+sys.stdout.write("<<<HEADER>>>\n")
+sys.stdout.write("mode=histo\n")
+sys.stdout.write("width=%d\n" % WIDTH)
+sys.stdout.write("height=%d\n" % HEIGHT)
+sys.stdout.write("framerate_set=%d\n" % FRAMERATE)
+sys.stdout.write("framerate_status=%s\n" % fr_ok)
+sys.stdout.write("<<<STREAM>>>\n")
+
+t0_ms = time.ticks_ms()
+t0_us = time.ticks_us()
+frames = 0
+try:
+    while time.ticks_diff(time.ticks_ms(), t0_ms) < DURATION_MS:
+        img = cam.snapshot()
+        t_us = time.ticks_diff(time.ticks_us(), t0_us)
+        b64 = binascii.b2a_base64(bytes(img), newline=False).decode()
+        sys.stdout.write("F %d %s\n" % (t_us, b64))
+        frames += 1
+except KeyboardInterrupt:
+    pass
+
+t1_us = time.ticks_us()
+sys.stdout.write("<<<FOOTER>>>\n")
+sys.stdout.write("frames=%d\n" % frames)
+sys.stdout.write("elapsed_us=%d\n" % time.ticks_diff(t1_us, t0_us))
+sys.stdout.write("<<<END>>>\n")
+"""
+
+
 # --------------------------------------------------------------------------
 # Streaming reader (background thread)
 # --------------------------------------------------------------------------
@@ -144,46 +200,22 @@ class _LineReader:
 # Public API
 # --------------------------------------------------------------------------
 
-class RecordingResult(Tuple[np.ndarray, dict]):
-    """Tuple subtype just for type hint clarity."""
+def _stream_until_done(
+    ser: serial.Serial,
+    script: str,
+    duration_s: Optional[float],
+    show_status: bool,
+    on_chunk,
+    chunk_prefix: str,
+    status_unit: str,
+):
+    """Run `script` on the camera, parse the stream, return (meta, stop_requested).
 
-
-def record(
-    port: str,
-    output_path: Optional[str] = None,
-    duration_s: Optional[float] = None,
-    evt_res: int = 2048,
-    show_status: bool = True,
-) -> Tuple[np.ndarray, dict, str]:
-    """Record events from one camera into a .npz file.
-
-    Args:
-        port: serial device, e.g. "/dev/ttyACM0" or "COM3".
-        output_path: where to save the .npz. Defaults to recording_YYYYMMDD_HHMMSS.npz.
-        duration_s: fixed capture duration. None = record until Ctrl+C.
-        evt_res: per-ioctl event buffer size on the device (pow2 in [1024, 65536]).
-        show_status: print a live "X events captured (Y ev/s)" line.
-
-    Returns:
-        (events, metadata, output_path) tuple. The events array is also saved to disk.
+    `on_chunk(parts)` is called for every line that starts with `chunk_prefix`,
+    with parts already split into [prefix, ...]. It returns either an int
+    (count of decoded units, e.g. events/frames) or None on parse failure.
     """
-    if output_path is None:
-        output_path = f"recording_{dt.datetime.now():%Y%m%d_%H%M%S}.npz"
-
-    # Use a 24-hour internal timeout when the user wants Ctrl+C-driven capture;
-    # the host's SIGINT handler interrupts well before that.
-    duration_ms = (
-        int(duration_s * 1000) if duration_s is not None
-        else 24 * 60 * 60 * 1000
-    )
-
-    script = _CAPTURE_SCRIPT.format(evt_res=evt_res, duration_ms=duration_ms)
-
-    print(f"[record] opening {port} …")
-    ser = cam_mod.open_raw_repl(port)
     reader = _LineReader(ser)
-
-    # SIGINT → interrupt the on-camera script so it emits the footer.
     stop_requested = threading.Event()
 
     def _sigint_handler(_sig, _frame):
@@ -195,9 +227,7 @@ def record(
 
     prev_sigint = signal.signal(signal.SIGINT, _sigint_handler)
 
-    chunks: List[np.ndarray] = []
     meta: dict = {}
-    saw_header = False
     in_stream = False
     saw_footer = False
     saw_end = False
@@ -213,13 +243,11 @@ def record(
     last_print = time.time()
     last_count = 0
     started_streaming_at: Optional[float] = None
+    post_ctrlc_deadline: Optional[float] = None
 
     try:
         reader.start()
         cam_mod.start_exec(ser, script)
-
-        # Cap how long we wait after the script ends or after Ctrl+C.
-        post_ctrlc_deadline: Optional[float] = None
 
         while True:
             for line in reader.get_lines():
@@ -227,7 +255,6 @@ def record(
                 if not text:
                     continue
                 if text == "<<<HEADER>>>":
-                    saw_header = True
                     continue
                 if text == "<<<STREAM>>>":
                     in_stream = True
@@ -241,25 +268,17 @@ def record(
                     saw_end = True
                     continue
 
-                if in_stream and text.startswith("C "):
+                if in_stream and text.startswith(chunk_prefix + " "):
                     chunks_received += 1
                     parts = text.split(" ", 2)
                     if len(parts) != 3:
                         chunks_malformed += 1
                         continue
-                    try:
-                        n = int(parts[1])
-                        raw = base64.b64decode(parts[2])
-                    except (ValueError, base64.binascii.Error):
+                    decoded_n = on_chunk(parts)
+                    if decoded_n is None:
                         chunks_malformed += 1
-                        continue
-                    if len(raw) != n * 6 * 2:
-                        chunks_malformed += 1
-                        continue
-                    chunks.append(
-                        np.frombuffer(raw, dtype=np.uint16).reshape(n, 6).copy()
-                    )
-                    total_decoded += n
+                    else:
+                        total_decoded += decoded_n
                     continue
 
                 if "=" in text and not in_stream:
@@ -276,7 +295,7 @@ def record(
 
             if stop_requested.is_set():
                 if post_ctrlc_deadline is None:
-                    post_ctrlc_deadline = time.time() + 3.0  # 3 s grace
+                    post_ctrlc_deadline = time.time() + 3.0
                 if time.time() > post_ctrlc_deadline:
                     print("[record] camera did not emit footer; saving what we have")
                     break
@@ -286,7 +305,8 @@ def record(
                 if now - last_print > 0.5:
                     rate = (total_decoded - last_count) / max(now - last_print, 1e-9)
                     sys.stdout.write(
-                        f"\r[record] {total_decoded:>9} events  ({rate:>8.0f} ev/s)  "
+                        f"\r[record] {total_decoded:>9} {status_unit}  "
+                        f"({rate:>8.0f} {status_unit}/s)  "
                     )
                     sys.stdout.flush()
                     last_print = now
@@ -301,25 +321,127 @@ def record(
         reader.stop()
         cam_mod.close_raw_repl(ser)
 
-    if chunks:
-        events = np.concatenate(chunks, axis=0)
-    else:
-        events = np.zeros((0, 6), dtype=np.uint16)
-
     meta["chunks_received"] = chunks_received
     meta["chunks_malformed"] = chunks_malformed
-    meta["decoded_events"] = total_decoded
+    meta["decoded_events"] = total_decoded  # generic "decoded count" name kept
+    meta["stopped_by_user"] = bool(stop_requested.is_set())
+    return meta
+
+
+def record_events(
+    port: str,
+    output_path: Optional[str] = None,
+    duration_s: Optional[float] = None,
+    evt_res: int = 2048,
+    show_status: bool = True,
+) -> Tuple[np.ndarray, dict, str]:
+    """Record raw events into a .npz file."""
+    if output_path is None:
+        output_path = f"recording_{dt.datetime.now():%Y%m%d_%H%M%S}.npz"
+
+    duration_ms = (
+        int(duration_s * 1000) if duration_s is not None
+        else 24 * 60 * 60 * 1000
+    )
+
+    script = _EVENTS_SCRIPT.format(evt_res=evt_res, duration_ms=duration_ms)
+
+    print(f"[record] opening {port} … (mode: events)")
+    ser = cam_mod.open_raw_repl(port)
+    chunks: List[np.ndarray] = []
+
+    def _on_event_chunk(parts):
+        try:
+            n = int(parts[1])
+            raw = base64.b64decode(parts[2])
+        except (ValueError, base64.binascii.Error):
+            return None
+        if len(raw) != n * 6 * 2:
+            return None
+        chunks.append(np.frombuffer(raw, dtype=np.uint16).reshape(n, 6).copy())
+        return n
+
+    meta = _stream_until_done(
+        ser, script, duration_s, show_status,
+        on_chunk=_on_event_chunk, chunk_prefix="C", status_unit="events",
+    )
+
+    events = (np.concatenate(chunks, axis=0)
+              if chunks else np.zeros((0, 6), dtype=np.uint16))
+
     meta["host_capture_started"] = dt.datetime.now().isoformat()
     meta["host_port"] = port
-    meta["stopped_by_user"] = bool(stop_requested.is_set())
-    meta["duration_s"] = meta.get("elapsed_us", 0) / 1e6 if meta.get("elapsed_us") else duration_s
+    meta["mode"] = fmt.MODE_EVENTS
+    meta["duration_s"] = (meta.get("elapsed_us", 0) / 1e6
+                          if meta.get("elapsed_us") else duration_s)
 
-    fmt.save_recording(output_path, events, meta)
-
+    fmt.save_events(output_path, events, meta)
     return events, meta, output_path
 
 
-def print_summary(events: np.ndarray, meta: dict, output_path: str) -> None:
+def record_histo(
+    port: str,
+    output_path: Optional[str] = None,
+    duration_s: Optional[float] = None,
+    framerate: int = 30,
+    show_status: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, dict, str]:
+    """Record histogram-mode frames into a .npz file."""
+    if output_path is None:
+        output_path = f"recording_{dt.datetime.now():%Y%m%d_%H%M%S}.npz"
+
+    duration_ms = (
+        int(duration_s * 1000) if duration_s is not None
+        else 24 * 60 * 60 * 1000
+    )
+
+    script = _HISTO_SCRIPT.format(framerate=framerate, duration_ms=duration_ms)
+
+    print(f"[record] opening {port} … (mode: histo, framerate={framerate})")
+    ser = cam_mod.open_raw_repl(port)
+    frames: List[np.ndarray] = []
+    timestamps: List[int] = []
+
+    def _on_frame_chunk(parts):
+        try:
+            t_us = int(parts[1])
+            raw = base64.b64decode(parts[2])
+        except (ValueError, base64.binascii.Error):
+            return None
+        if len(raw) != 320 * 320:
+            return None
+        frames.append(np.frombuffer(raw, dtype=np.uint8).reshape(320, 320).copy())
+        timestamps.append(t_us)
+        return 1
+
+    meta = _stream_until_done(
+        ser, script, duration_s, show_status,
+        on_chunk=_on_frame_chunk, chunk_prefix="F", status_unit="frames",
+    )
+
+    if frames:
+        frames_arr = np.stack(frames, axis=0)
+        ts_arr = np.array(timestamps, dtype=np.int64)
+    else:
+        frames_arr = np.zeros((0, 320, 320), dtype=np.uint8)
+        ts_arr = np.zeros((0,), dtype=np.int64)
+
+    meta["host_capture_started"] = dt.datetime.now().isoformat()
+    meta["host_port"] = port
+    meta["mode"] = fmt.MODE_HISTO
+    meta["framerate_requested"] = framerate
+    meta["duration_s"] = (meta.get("elapsed_us", 0) / 1e6
+                          if meta.get("elapsed_us") else duration_s)
+
+    fmt.save_frames(output_path, frames_arr, ts_arr, meta)
+    return frames_arr, ts_arr, meta, output_path
+
+
+# Back-compat alias for the original API.
+record = record_events
+
+
+def print_events_summary(events: np.ndarray, meta: dict, output_path: str) -> None:
     n = events.shape[0]
     print(f"[record] saved {n} events → {output_path}")
     if n == 0:
@@ -343,3 +465,26 @@ def print_summary(events: np.ndarray, meta: dict, output_path: str) -> None:
             f"[record]   sensor saturation: {sat}/{iters} reads at EVT_RES "
             f"({100*sat/max(1,iters):.1f}%)"
         )
+
+
+def print_histo_summary(
+    frames: np.ndarray, timestamps_us: np.ndarray,
+    meta: dict, output_path: str,
+) -> None:
+    n = frames.shape[0]
+    print(f"[record] saved {n} frames → {output_path}")
+    if n == 0:
+        return
+    span_s = (int(timestamps_us[-1]) - int(timestamps_us[0])) / 1e6
+    fps = n / max(span_s, 1e-9)
+    print(
+        f"[record]   frame_shape={frames.shape[1:]}  dtype={frames.dtype}"
+    )
+    print(f"[record]   timespan ≈ {span_s:.3f} s, average ≈ {fps:.1f} FPS "
+          f"(requested {meta.get('framerate_requested', '?')})")
+    mb = frames.nbytes / (1024 * 1024)
+    print(f"[record]   raw frame data: {mb:.1f} MB ({frames.nbytes} bytes)")
+
+
+# Back-compat alias.
+print_summary = print_events_summary

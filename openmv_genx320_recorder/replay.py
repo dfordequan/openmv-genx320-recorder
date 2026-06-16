@@ -51,17 +51,18 @@ def bin_events_to_frames(
 def run(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(
         prog="genx320 replay",
-        description="Play back a recorded .npz event stream.",
+        description="Play back a recorded .npz file (event-mode or histo-mode).",
     )
     ap.add_argument("file", help="path to recording_*.npz")
     ap.add_argument(
         "--fps", type=float, default=None,
-        help="frame rate in Hz — sets the time-bin width to 1000/fps "
-             "(default: 50). Overrides --bin-ms.",
+        help="[event mode] playback frame rate in Hz — sets the time-bin "
+             "width to 1000/fps (default: 50). Overrides --bin-ms. "
+             "[histo mode] ignored; recorded timestamps drive playback.",
     )
     ap.add_argument(
         "--bin-ms", type=float, default=None,
-        help="time bin width in milliseconds (default: 20)",
+        help="[event mode] time bin width in milliseconds (default: 20)",
     )
     ap.add_argument(
         "--speed", type=float, default=1.0,
@@ -78,12 +79,22 @@ def run(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     try:
-        events, meta = fmt.load_recording(args.file)
+        mode = fmt.detect_mode(args.file)
     except FileNotFoundError:
         print(f"error: no such file: {args.file}", file=sys.stderr)
         return 1
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
-    print(f"loaded {events.shape[0]} events from {args.file}")
+    if mode == fmt.MODE_HISTO:
+        return _replay_histo(args)
+    return _replay_events(args)
+
+
+def _replay_events(args) -> int:
+    events, meta = fmt.load_events(args.file)
+    print(f"loaded {events.shape[0]} events from {args.file} (event mode)")
     if not events.size:
         print("(empty recording)")
         return 1
@@ -107,46 +118,75 @@ def run(argv: list[str]) -> int:
 
     interval_ms = max(1, int(bin_ms / args.speed))
 
+    return _render_animation(frames, interval_ms, args.save)
+
+
+def _replay_histo(args) -> int:
+    frames_arr, ts_us, meta = fmt.load_frames(args.file)
+    n = frames_arr.shape[0]
+    print(f"loaded {n} frames from {args.file} (histo mode)")
+    if n == 0:
+        print("(empty recording)")
+        return 1
+
+    # Use recorded inter-frame interval as the playback period.
+    if n >= 2:
+        mean_dt_us = float((ts_us[-1] - ts_us[0]) / max(n - 1, 1))
+    else:
+        mean_dt_us = 1000.0 / max(meta.get("framerate_requested", 30), 1) * 1000.0
+    interval_ms = max(1, int((mean_dt_us / 1000.0) / args.speed))
+    print(f"playback interval: {interval_ms} ms "
+          f"({1000.0 / max(interval_ms, 1):.1f} FPS at speed={args.speed})")
+
+    if args.max_frames:
+        frames_arr = frames_arr[: args.max_frames]
+        ts_us = ts_us[: args.max_frames]
+    frame_pairs = [(int(ts_us[i]), frames_arr[i]) for i in range(frames_arr.shape[0])]
+    return _render_animation(frame_pairs, interval_ms, args.save)
+
+
+def _render_animation(frame_pairs, interval_ms, save_path) -> int:
     try:
         import matplotlib
     except ImportError:
         print(
             "error: matplotlib is required for replay. install with: "
-            "pip install matplotlib  (or 'pip install \"openmv-genx320-recorder[viz]\"')",
+            "pip install matplotlib  (or 'pip install "
+            "\"openmv-genx320-recorder[viz]\"')",
             file=sys.stderr,
         )
         return 2
-    if args.save:
+    if save_path:
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib import animation
 
     fig, ax = plt.subplots(figsize=(6, 6))
     im = ax.imshow(
-        frames[0][1], cmap="gray", vmin=0, vmax=255, interpolation="nearest"
+        frame_pairs[0][1], cmap="gray", vmin=0, vmax=255, interpolation="nearest"
     )
     txt = ax.set_title("")
     ax.set_xticks([])
     ax.set_yticks([])
 
     def update(i):
-        t_us, frame = frames[i]
+        t_us, frame = frame_pairs[i]
         im.set_array(frame)
-        txt.set_text(f"t = {t_us / 1e6:.3f} s  ({i + 1}/{len(frames)})")
+        txt.set_text(f"t = {t_us / 1e6:.3f} s  ({i + 1}/{len(frame_pairs)})")
         return im, txt
 
     anim = animation.FuncAnimation(
-        fig, update, frames=len(frames),
+        fig, update, frames=len(frame_pairs),
         interval=interval_ms, blit=False, repeat=True,
     )
 
-    if args.save:
-        print(f"rendering to {args.save} …")
+    if save_path:
+        print(f"rendering to {save_path} …")
         fps = max(1, int(1000 / interval_ms))
-        if args.save.endswith(".gif"):
-            anim.save(args.save, writer="pillow", fps=fps)
+        if save_path.endswith(".gif"):
+            anim.save(save_path, writer="pillow", fps=fps)
         else:
-            anim.save(args.save, writer="ffmpeg", fps=fps)
+            anim.save(save_path, writer="ffmpeg", fps=fps)
         print("done")
     else:
         plt.show()
