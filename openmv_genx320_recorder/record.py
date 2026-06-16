@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import signal
+import struct
 import sys
 import threading
 import time
@@ -25,6 +26,7 @@ import serial
 
 from . import cameras as cam_mod
 from . import format as fmt
+from . import omv_protocol as omv
 
 
 # --------------------------------------------------------------------------
@@ -432,6 +434,263 @@ def record_histo(
     meta["framerate_requested"] = framerate
     meta["duration_s"] = (meta.get("elapsed_us", 0) / 1e6
                           if meta.get("elapsed_us") else duration_s)
+
+    fmt.save_frames(output_path, frames_arr, ts_arr, meta)
+    return frames_arr, ts_arr, meta, output_path
+
+
+# --------------------------------------------------------------------------
+# OMV_PROTOCOL transport for histogram mode
+# --------------------------------------------------------------------------
+# On firmware v5.x boards (where legacy USBDBG was replaced with the new
+# framed OMV_PROTOCOL), the stream channel can deliver raw frames at much
+# higher rates than the REPL+base64 path (~70+ FPS measured for 320x320
+# uint8 frames vs ~24 FPS via REPL). This implementation pulls frames over
+# OMV_PROTOCOL's stream channel and saves to the same npz schema.
+
+GENX320_CHIP_ID = 0xB0602003  # GENX320_ID_MP — used as stream-source key
+
+# On-camera script for histo mode under OMV_PROTOCOL. We DON'T base64-emit
+# anything from Python — the firmware writes frames into the stream FB via
+# framebuffer_update_preview() automatically as long as snapshot() keeps
+# running.
+_OMV_HISTO_SCRIPT = r"""
+import csi
+cam = csi.CSI(cid=csi.GENX320)
+cam.reset()
+cam.pixformat(csi.GRAYSCALE)
+cam.framesize((320, 320))
+cam.framerate({framerate})
+print('init done')
+while True:
+    cam.snapshot()
+"""
+
+
+def _wait_for_stdout(p: omv.OmvProtocol, marker: str,
+                     timeout_s: float) -> str:
+    """Poll the stdout channel until `marker` appears or timeout."""
+    acc = ""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        sz = p.channel_size(omv.CHAN_STDOUT)
+        if isinstance(sz, int) and sz > 0:
+            data = p.channel_read(omv.CHAN_STDOUT, 0, sz)
+            acc += data.decode(errors="replace")
+            if marker in acc:
+                return acc
+        else:
+            time.sleep(0.02)
+    return acc
+
+
+def record_histo_omv(
+    port: str,
+    output_path: Optional[str] = None,
+    duration_s: Optional[float] = None,
+    framerate: int = 100,
+    show_status: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, dict, str]:
+    """Record histogram-mode frames via OMV_PROTOCOL (firmware v5.x).
+
+    Same return shape as `record_histo()`. Auto-falls-back to the REPL path
+    is handled at the CLI layer (see __main__.py).
+    """
+    if output_path is None:
+        output_path = f"recording_{dt.datetime.now():%Y%m%d_%H%M%S}.npz"
+
+    duration_ms = (
+        int(duration_s * 1000) if duration_s is not None
+        else 24 * 60 * 60 * 1000
+    )
+
+    print(f"[record] opening {port} via OMV_PROTOCOL "
+          f"(mode: histo, framerate={framerate})")
+
+    frames: List[np.ndarray] = []
+    timestamps_us: List[int] = []
+    n_size_polls = 0
+    n_lock_fail = 0
+    n_read_fail = 0
+    chunks_received = 0
+    chunks_malformed = 0  # framebuffer header sanity errors
+
+    stop_requested = threading.Event()
+    p = omv.OmvProtocol(port, timeout=2.0)
+    p.__enter__()  # we manage entry/exit manually to allow SIGINT cleanup
+
+    def _sigint_handler(_sig, _frame):
+        if not stop_requested.is_set():
+            stop_requested.set()
+            sys.stdout.write("\n[record] Ctrl+C — stopping camera …\n")
+            sys.stdout.flush()
+
+    prev_sigint = signal.signal(signal.SIGINT, _sigint_handler)
+
+    last_print = time.time()
+    last_count = 0
+    t_capture_start: Optional[float] = None
+    success = False
+
+    try:
+        # 1. Handshake + capability negotiation (disable ACK+CRC for speed).
+        p.sync()
+        p.set_caps(crc_enabled=False, seq_enabled=True, ack_enabled=False)
+
+        # 2. Kill main.py / any user script so we own the MicroPython runtime.
+        p.stdin_stop()
+        time.sleep(0.4)
+        # Drain any banner/output left from previous runs.
+        for _ in range(8):
+            sz = p.channel_size(omv.CHAN_STDOUT)
+            if isinstance(sz, int) and sz > 0:
+                p.channel_read(omv.CHAN_STDOUT, 0, sz)
+            else:
+                break
+
+        # 3. Configure the stream channel.
+        p.channel_ioctl(omv.CHAN_STREAM, omv.IOCTL_STREAM_SOURCE,
+                        arg=struct.pack("<I", GENX320_CHIP_ID))
+        p.channel_ioctl(omv.CHAN_STREAM, omv.IOCTL_STREAM_RAW_CFG,
+                        arg=struct.pack("<II", 320, 320))
+        p.channel_ioctl(omv.CHAN_STREAM, omv.IOCTL_STREAM_RAW_CTRL,
+                        arg=struct.pack("<I", 1))
+        p.stream_enable(True)
+
+        # 4. Start the snapshot loop on-device.
+        script = _OMV_HISTO_SCRIPT.format(framerate=framerate)
+        p.stdin_exec(script)
+        banner = _wait_for_stdout(p, "init done", timeout_s=3.0)
+        if "init done" not in banner:
+            print(f"[record] WARNING: didn't see 'init done' marker; "
+                  f"stdout so far: {banner!r}")
+
+        # 5. Stream frames until duration / Ctrl+C.
+        if duration_s is None:
+            print("[record] no --duration set, recording until Ctrl+C")
+        else:
+            print(f"[record] capturing for {duration_s:.1f} s")
+
+        capture_deadline = (
+            time.time() + duration_s if duration_s is not None
+            else float("inf")
+        )
+        t_capture_start = time.time()
+
+        while not stop_requested.is_set() and time.time() < capture_deadline:
+            try:
+                sz = p.channel_size(omv.CHAN_STREAM)
+            except Exception as e:
+                print(f"\n[record] stream size err: {e}")
+                break
+            n_size_polls += 1
+
+            if not isinstance(sz, int) or sz <= 0:
+                time.sleep(0.001)
+                continue
+
+            try:
+                if not p.channel_lock(omv.CHAN_STREAM):
+                    n_lock_fail += 1
+                    continue
+            except Exception as e:
+                print(f"\n[record] lock err: {e}")
+                break
+
+            try:
+                payload = p.channel_read(omv.CHAN_STREAM, 0, sz)
+                t_frame = time.time()
+            except Exception as e:
+                p.channel_unlock(omv.CHAN_STREAM)
+                n_read_fail += 1
+                continue
+
+            p.channel_unlock(omv.CHAN_STREAM)
+            chunks_received += 1
+
+            # Frame layout: 32-byte aligned header + 320*320 image bytes.
+            if len(payload) < 32 + 320 * 320:
+                chunks_malformed += 1
+                continue
+
+            # Header fields we care about for round-trip diagnostics.
+            w, h, pixfmt, comp_size, offset = struct.unpack(
+                "<IIIII", payload[:20]
+            )
+            (fps_dev,) = struct.unpack("<f", payload[20:24])
+
+            if w != 320 or h != 320:
+                chunks_malformed += 1
+                continue
+
+            # data starts at the 32-byte cache-aligned boundary.
+            frame = np.frombuffer(
+                payload[32:32 + 320 * 320], dtype=np.uint8
+            ).reshape(320, 320).copy()
+            frames.append(frame)
+            timestamps_us.append(
+                int((t_frame - t_capture_start) * 1_000_000)
+            )
+
+            if show_status and (time.time() - last_print) > 0.5:
+                now = time.time()
+                rate = (len(frames) - last_count) / max(now - last_print, 1e-9)
+                sys.stdout.write(
+                    f"\r[record] {len(frames):>6} frames  "
+                    f"({rate:>5.1f} fps, dev_fps={fps_dev:.1f})  "
+                )
+                sys.stdout.flush()
+                last_print = now
+                last_count = len(frames)
+
+        success = True
+
+    finally:
+        if show_status:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        signal.signal(signal.SIGINT, prev_sigint)
+        # Best-effort cleanup.
+        try:
+            p.stdin_stop()
+        except Exception:
+            pass
+        try:
+            p.stream_enable(False)
+        except Exception:
+            pass
+        try:
+            p.__exit__(None, None, None)
+        except Exception:
+            pass
+
+    if frames:
+        frames_arr = np.stack(frames, axis=0)
+        ts_arr = np.array(timestamps_us, dtype=np.int64)
+    else:
+        frames_arr = np.zeros((0, 320, 320), dtype=np.uint8)
+        ts_arr = np.zeros((0,), dtype=np.int64)
+
+    elapsed_s = (
+        timestamps_us[-1] / 1e6 if timestamps_us
+        else (duration_s if duration_s else 0.0)
+    )
+    meta = {
+        "mode": fmt.MODE_HISTO,
+        "transport": "omv_protocol",
+        "framerate_requested": framerate,
+        "frames": len(frames),
+        "decoded_events": len(frames),  # generic name shared with events path
+        "chunks_received": chunks_received,
+        "chunks_malformed": chunks_malformed,
+        "size_polls": n_size_polls,
+        "lock_failures": n_lock_fail,
+        "read_failures": n_read_fail,
+        "host_capture_started": dt.datetime.now().isoformat(),
+        "host_port": port,
+        "stopped_by_user": bool(stop_requested.is_set()),
+        "duration_s": elapsed_s,
+    }
 
     fmt.save_frames(output_path, frames_arr, ts_arr, meta)
     return frames_arr, ts_arr, meta, output_path

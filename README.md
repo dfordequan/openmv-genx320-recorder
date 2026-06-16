@@ -88,7 +88,8 @@ buffer.
 | `--duration N` | until Ctrl+C | fixed capture length in seconds |
 | `--output PATH`, `-o` | `recording_TIMESTAMP.npz` | output file |
 | `--evt-res N` | 2048 | [events] per-ioctl event buffer (pow2 in [1024, 65536]) |
-| `--framerate N` | 30 | [histo] target frame rate (actual cap ≈ 20–24 FPS) |
+| `--framerate N` | 30 | [histo] target frame rate (actual cap depends on transport) |
+| `--transport {auto,repl,omv}` | auto | [histo] frame fetch path; see below |
 | `--no-status` | off | suppress the live status line |
 | `--no-verify` | off | skip the GenX320 capability probe |
 
@@ -169,15 +170,19 @@ overhead). At 12 bytes per decoded event, that's about **1 MEv/s** sustained
 per camera. For high event rates, increase `--evt-res` (e.g. 8192 or 16384) so
 each ioctl returns a fuller batch and the sensor FIFO is drained faster.
 
-**Histogram mode**: on the OpenMV firmware tested (build `cd4fb3ad60`),
-streaming 320×320 grayscale frames via the raw REPL caps at **~20–24 FPS**
-regardless of the requested `--framerate`. The bottleneck is not the sensor —
-`csi.snapshot()` itself can do 300+ FPS — but the per-frame
-`binascii.b2a_base64()` + `sys.stdout.write` over USB-CDC (≈ 40 ms/frame on
-the device CPU). If you need higher histo-mode FPS (e.g. 100 FPS like the
-OpenMV IDE achieves), use the binary USBDBG protocol directly (see
-[openmv/openmv](https://github.com/openmv/openmv) source) — this recorder
-prioritises a clean REPL protocol over peak histo throughput.
+**Histogram mode** — two transports, picked automatically by `--transport
+auto` (the default):
+
+| Transport | Firmware required | Sustained FPS @ 320×320 | Why |
+|---|---|---:|---|
+| `repl` | any | ~20–24 | Each frame is `binascii.b2a_base64()`-encoded then written to `sys.stdout` on the device. The per-frame CPU cost on the camera is ~40 ms (snapshot is fast, base64+stdout dominates). Works on any OpenMV firmware. |
+| `omv` | v5.x (post-2025-09-28, i.e. anything with the `OMV_PROTOCOL` framed protocol) | ~50–72 | Frames flow through the firmware's stream-FB and are pulled by the host via `CHANNEL_READ` on the stream channel. Fragmented across 25 × 4082-byte protocol packets (no CRC, no ACK, sequence-tracked). Host-side Python parsing of the per-fragment headers is the remaining bottleneck (the camera is producing ~100 FPS — `dev_fps` in the status line confirms this); a C/Cython parser would close the gap. |
+
+Sensor itself: `cam.snapshot()` runs at **300+ FPS** under both transports —
+the limit is in how fast the host can drain frames.
+
+USB throughput on the RT1062 is USB-HS (480 Mbit/s); the bottleneck for both
+transports is per-frame CPU overhead, not the wire.
 
 ## Troubleshooting
 

@@ -64,6 +64,13 @@ def _cmd_record(argv: List[str]) -> int:
     ap.add_argument("--framerate", type=int, default=30,
                     help="[histo mode] target frame rate in Hz (default 30). "
                          "Higher rates may exceed USB throughput.")
+    ap.add_argument("--transport", choices=("auto", "repl", "omv"),
+                    default="auto",
+                    help="[histo mode] how to fetch frames. 'omv' uses the "
+                         "framed OMV_PROTOCOL (firmware v5+) for ~3x the "
+                         "REPL throughput. 'repl' falls back to the legacy "
+                         "raw-REPL+base64 path that works on any firmware. "
+                         "'auto' (default) tries OMV first then REPL.")
     ap.add_argument("--no-status", action="store_true",
                     help="suppress the live status line")
     ap.add_argument("--no-verify", action="store_true",
@@ -96,15 +103,49 @@ def _cmd_record(argv: List[str]) -> int:
         )
         record_mod.print_events_summary(events, meta, out_path)
     else:
-        frames, ts, meta, out_path = record_mod.record_histo(
-            port=port,
-            output_path=args.output,
-            duration_s=args.duration,
-            framerate=args.framerate,
-            show_status=not args.no_status,
-        )
+        transport = _resolve_transport(args.transport, port)
+        if transport == "omv":
+            frames, ts, meta, out_path = record_mod.record_histo_omv(
+                port=port,
+                output_path=args.output,
+                duration_s=args.duration,
+                framerate=args.framerate,
+                show_status=not args.no_status,
+            )
+        else:
+            frames, ts, meta, out_path = record_mod.record_histo(
+                port=port,
+                output_path=args.output,
+                duration_s=args.duration,
+                framerate=args.framerate,
+                show_status=not args.no_status,
+            )
         record_mod.print_histo_summary(frames, ts, meta, out_path)
     return 0
+
+
+def _resolve_transport(requested: str, port: str) -> str:
+    """Pick a transport for histo mode.
+
+    'omv' or 'repl': used as-is.
+    'auto': probe OMV_PROTOCOL by sending PROTO_SYNC; fall back to REPL if it
+            doesn't respond.
+    """
+    if requested != "auto":
+        return requested
+
+    # Auto-detect: quick OMV sync attempt.
+    from . import omv_protocol as omv
+    try:
+        with omv.OmvProtocol(port, timeout=0.5) as p:
+            p.sync(retries=1, timeout=0.5)
+        print("[record] auto-detected transport: omv "
+              "(firmware speaks OMV_PROTOCOL)")
+        return "omv"
+    except Exception:
+        print("[record] auto-detected transport: repl "
+              "(firmware does not speak OMV_PROTOCOL)")
+        return "repl"
 
 
 def _cmd_replay(argv: List[str]) -> int:
