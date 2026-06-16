@@ -27,12 +27,62 @@ packets with the EVENT flag set.
 
 from __future__ import annotations
 
+import ctypes
+import os
 import struct
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import serial
+
+
+# --------------------------------------------------------------------------
+# Optional C decoder for fragment reassembly
+# --------------------------------------------------------------------------
+# When _omv_decoder.so is built (see _omv_decoder.c in this dir), we can hand
+# off the per-fragment SYNC-hunt + header-parse + payload-concat loop to C,
+# which cuts per-frame host overhead from ~12-15 ms to <1 ms. Built via:
+#   cc -O2 -shared -fPIC -o _omv_decoder.so _omv_decoder.c
+
+_DECODER: Optional[ctypes.CDLL] = None
+
+
+def _try_load_decoder() -> Optional[ctypes.CDLL]:
+    here = os.path.dirname(os.path.abspath(__file__))
+    so_path = os.path.join(here, "_omv_decoder.so")
+    if not os.path.exists(so_path):
+        return None
+    try:
+        lib = ctypes.CDLL(so_path)
+    except OSError:
+        return None
+
+    # ssize_t omv_read_fragments(
+    #     int fd, uint8_t *out_buf, size_t out_cap, uint32_t timeout_ms,
+    #     uint8_t *last_opcode, uint8_t *last_seq,
+    #     uint8_t *last_chan, uint8_t *last_flags
+    # )
+    lib.omv_read_fragments.argtypes = [
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    lib.omv_read_fragments.restype = ctypes.c_ssize_t
+    return lib
+
+
+_DECODER = _try_load_decoder()
+
+
+def has_native_decoder() -> bool:
+    """True iff the C fragment decoder is available."""
+    return _DECODER is not None
 
 
 # --------------------------------------------------------------------------
@@ -564,6 +614,62 @@ class OmvProtocol:
                 f"CHANNEL_READ NAK: status={pkt.payload[:2].hex()}"
             )
         return pkt.payload
+
+    def channel_read_into(self, channel: int, offset: int, length: int,
+                          out: bytearray, timeout_ms: int = 4000) -> int:
+        """Fast frame read: dispatch to the native C decoder when available.
+
+        Reads a fragmented response directly into the caller-provided `out`
+        bytearray (must be at least `length` bytes), skipping events and
+        concatenating fragment payloads in C. Returns the number of bytes
+        written. Falls back to the pure-Python path (with a copy into `out`)
+        when the C decoder isn't built or ack_enabled is on.
+
+        Preconditions for the fast path:
+          - SET_CAPS(crc_enabled=False, ack_enabled=False) was negotiated
+          - the serial port is in blocking mode with a sane timeout
+        """
+        if len(out) < length:
+            raise ValueError(f"out buffer too small ({len(out)} < {length})")
+
+        # Fall back to pure Python when C extension is missing or when ACK is
+        # still enabled (the fast path doesn't send per-fragment ACKs).
+        if _DECODER is None or self._ack_enabled:
+            data = self.channel_read(channel, offset, length)
+            n = min(len(data), len(out))
+            out[:n] = data[:n]
+            self._seq = (self._seq) & 0xFF
+            return n
+
+        # Send the request via the regular path (host->device direction is
+        # cheap; only the response reassembly is hot).
+        assert self._ser is not None
+        body = struct.pack("<II", offset, length)
+        self._send(channel, OP_CHANNEL_READ, body)
+
+        # Hand the fd to C. We use the same fd pyserial owns; we don't dup it.
+        fd = self._ser.fileno()
+        Buf = ctypes.c_uint8 * len(out)
+        c_out = Buf.from_buffer(out)
+        last_opcode = ctypes.c_uint8(0)
+        last_seq = ctypes.c_uint8(0)
+        last_chan = ctypes.c_uint8(0)
+        last_flags = ctypes.c_uint8(0)
+
+        n = _DECODER.omv_read_fragments(
+            fd, c_out, len(out), int(timeout_ms),
+            ctypes.byref(last_opcode), ctypes.byref(last_seq),
+            ctypes.byref(last_chan), ctypes.byref(last_flags),
+        )
+        if n < 0:
+            raise RuntimeError(
+                f"native decoder returned {n} "
+                f"(-1=read err, -2=timeout, -3=overflow)"
+            )
+
+        # Sync our seq counter to the device's after the multi-fragment send.
+        self._seq = (last_seq.value + 1) & 0xFF
+        return int(n)
 
     def channel_write(self, channel: int, offset: int, data: bytes) -> Packet:
         body = struct.pack("<II", offset, len(data)) + data

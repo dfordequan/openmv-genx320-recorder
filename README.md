@@ -41,6 +41,15 @@ Or with `pipx` for an isolated CLI install:
 pipx install ".[viz]"
 ```
 
+**Optional: build the C fragment decoder** (lifts histo recording from
+~52 FPS to ~80 FPS — see throughput table below). Requires `cc` (gcc or
+clang) in `PATH`. Linux/macOS only; Windows users get the pure-Python path
+automatically.
+
+```bash
+python -m openmv_genx320_recorder._build_decoder
+```
+
 Linux: add yourself to the `dialout` group so you don't need `sudo` for the
 serial port:
 
@@ -173,16 +182,33 @@ each ioctl returns a fuller batch and the sensor FIFO is drained faster.
 **Histogram mode** — two transports, picked automatically by `--transport
 auto` (the default):
 
-| Transport | Firmware required | Sustained FPS @ 320×320 | Why |
-|---|---|---:|---|
-| `repl` | any | ~20–24 | Each frame is `binascii.b2a_base64()`-encoded then written to `sys.stdout` on the device. The per-frame CPU cost on the camera is ~40 ms (snapshot is fast, base64+stdout dominates). Works on any OpenMV firmware. |
-| `omv` | v5.x (post-2025-09-28, i.e. anything with the `OMV_PROTOCOL` framed protocol) | ~50–72 | Frames flow through the firmware's stream-FB and are pulled by the host via `CHANNEL_READ` on the stream channel. Fragmented across 25 × 4082-byte protocol packets (no CRC, no ACK, sequence-tracked). Host-side Python parsing of the per-fragment headers is the remaining bottleneck (the camera is producing ~100 FPS — `dev_fps` in the status line confirms this); a C/Cython parser would close the gap. |
+| Transport | C decoder | Firmware | Sustained FPS @ 320×320 |
+|---|---|---|---:|
+| `repl` | n/a | any | ~24 |
+| `omv` | pure Python | v5.x+ | ~52 |
+| `omv` | **native (`_omv_decoder.so`)** | v5.x+ | **~80** |
 
-Sensor itself: `cam.snapshot()` runs at **300+ FPS** under both transports —
-the limit is in how fast the host can drain frames.
+Camera-side: `cam.snapshot()` runs at **300+ FPS** under both transports —
+the sensor itself isn't the limit. `dev_fps` in the live status line shows
+what the firmware is actually producing (typically 100.0 at `--framerate 100`).
 
-USB throughput on the RT1062 is USB-HS (480 Mbit/s); the bottleneck for both
-transports is per-frame CPU overhead, not the wire.
+What each transport actually does:
+
+- **`repl`** — each frame is `binascii.b2a_base64()`-encoded inside MicroPython
+  and written to `sys.stdout` over USB-CDC. Per-frame on-camera CPU is ~40 ms
+  (base64 + stdout writes dominate); works on any OpenMV firmware.
+
+- **`omv`** — frames flow through the firmware's `FB_STREAM_ID` framebuffer
+  and are pulled by the host via `CHANNEL_READ` on the stream channel. Each
+  frame fragments into 25 × 4082-byte packets (header CRC and ACK disabled
+  via `SET_CAPS` for speed). Without the C decoder, the per-fragment Python
+  loop (SYNC hunt + `struct.unpack` + `bytearray.extend`) is the bottleneck;
+  with the C decoder, the host can decode at ~110 FPS and the remaining cap
+  comes from the host-camera **LOCK / READ / UNLOCK** round-trips (which hold
+  the framebuffer mutex and prevent the camera from writing the next frame).
+
+USB on the RT1062 is USB-HS (480 Mbit/s); the bottleneck for all paths is
+per-frame **CPU/round-trip overhead**, not the wire.
 
 ## Troubleshooting
 

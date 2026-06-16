@@ -515,6 +515,11 @@ def record_histo_omv(
     chunks_received = 0
     chunks_malformed = 0  # framebuffer header sanity errors
 
+    # Preallocated scratch buffer for the C decoder fast path. Holds one full
+    # framebuffer (32-byte aligned header + 320*320 image).
+    FRAME_BYTES = 32 + 320 * 320
+    scratch = bytearray(FRAME_BYTES + 64)  # 64 B of slop for header drift
+
     stop_requested = threading.Event()
     p = omv.OmvProtocol(port, timeout=2.0)
     p.__enter__()  # we manage entry/exit manually to allow SIGINT cleanup
@@ -577,18 +582,10 @@ def record_histo_omv(
         )
         t_capture_start = time.time()
 
+        # LOCK fails fast (NAK) when the framebuffer hasn't been refilled yet,
+        # so we use it as our frame-ready signal — no separate SIZE poll. The
+        # frame size is fixed for 320x320 grayscale, so we don't need to ask.
         while not stop_requested.is_set() and time.time() < capture_deadline:
-            try:
-                sz = p.channel_size(omv.CHAN_STREAM)
-            except Exception as e:
-                print(f"\n[record] stream size err: {e}")
-                break
-            n_size_polls += 1
-
-            if not isinstance(sz, int) or sz <= 0:
-                time.sleep(0.001)
-                continue
-
             try:
                 if not p.channel_lock(omv.CHAN_STREAM):
                     n_lock_fail += 1
@@ -598,7 +595,9 @@ def record_histo_omv(
                 break
 
             try:
-                payload = p.channel_read(omv.CHAN_STREAM, 0, sz)
+                n_read = p.channel_read_into(
+                    omv.CHAN_STREAM, 0, FRAME_BYTES, scratch
+                )
                 t_frame = time.time()
             except Exception as e:
                 p.channel_unlock(omv.CHAN_STREAM)
@@ -609,15 +608,15 @@ def record_histo_omv(
             chunks_received += 1
 
             # Frame layout: 32-byte aligned header + 320*320 image bytes.
-            if len(payload) < 32 + 320 * 320:
+            if n_read < FRAME_BYTES:
                 chunks_malformed += 1
                 continue
 
             # Header fields we care about for round-trip diagnostics.
-            w, h, pixfmt, comp_size, offset = struct.unpack(
-                "<IIIII", payload[:20]
+            w, h, pixfmt, comp_size, offset = struct.unpack_from(
+                "<IIIII", scratch, 0
             )
-            (fps_dev,) = struct.unpack("<f", payload[20:24])
+            (fps_dev,) = struct.unpack_from("<f", scratch, 20)
 
             if w != 320 or h != 320:
                 chunks_malformed += 1
@@ -625,7 +624,7 @@ def record_histo_omv(
 
             # data starts at the 32-byte cache-aligned boundary.
             frame = np.frombuffer(
-                payload[32:32 + 320 * 320], dtype=np.uint8
+                scratch, dtype=np.uint8, count=320 * 320, offset=32
             ).reshape(320, 320).copy()
             frames.append(frame)
             timestamps_us.append(

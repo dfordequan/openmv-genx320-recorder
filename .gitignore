@@ -7,6 +7,9 @@ dist/
 .venv/
 venv/
 
+# compiled C decoder (built per-platform by python -m _build_decoder)
+openmv_genx320_recorder/_omv_decoder.so
+
 # data outputs
 *.npz
 *.gif
